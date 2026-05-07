@@ -13,6 +13,8 @@ suppressPackageStartupMessages({
   library(AnnotationDbi)
   library(KEGGREST)
   library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+  library(ggridges)
+  library(viridis)
 })
 
 # Load input data
@@ -136,8 +138,8 @@ fwrite(feA, fe_path, sep = "\t")
 # Note: Perform all meta-analysis before plot generation for a given phenotype
 # Load meta-analysis data
 meta_dir <- c("") # set path to directory containing meta analyzed tsv files for each phenotype x region x celltype combination
-meta_files <- list.files(meta, pattern = "\\.tsv\\.gz$", full.names = TRUE)
-file_list <- data.table(path = files, file = basename(files))
+meta_files <- list.files(meta_dir, pattern = "\\.tsv\\.gz$", full.names = TRUE)
+file_list <- data.table(path = meta_files, file = basename(meta_files))
 meta <- rbindlist(lapply(file_list$path, fread, use.names = TRUE, fill = TRUE))
 
 # We'll create functions to generate plots
@@ -145,7 +147,7 @@ meta <- rbindlist(lapply(file_list$path, fread, use.names = TRUE, fill = TRUE))
 summary_dotplot <- function(meta, phenotype) {
   # Aggregate counts of significant DMCs
   # We count hyper and hypo separately to show directionality via color
-  summary_dt <- meta[get(flag) == TRUE, .(
+  summary_dt <- meta[Sig == TRUE, .(
     Total = .N,
     Hyper = sum(beta_hat > 0, na.rm = TRUE),
     Hypo  = sum(beta_hat < 0, na.rm = TRUE)
@@ -273,209 +275,217 @@ plot_manhattan(meta, phenotype)
 plot_volcano(meta, phenotype)
 
 
-# Gene ontology and pathway analysis---------------------------------------------------------------
-
-
-for (sig in c("FDR","Bonf","Nominal")) {
-  logmsg("[%s] Summary bars (per region) ...", sig);     plot_summary_bars_per_region(meta, phenotype, sig = sig)
-  logmsg("[%s] Summary DotPlot (FACET ALL) ...", sig); plot_glia_summary_dotplot(meta, phenotype, sig = sig)
-  logmsg("[%s] Manhattan ...", sig);                      plot_manhattan_all(meta, phenotype, sig = sig)
-  logmsg("[%s] Volcano ...", sig);                        plot_volcano_all(meta, phenotype, sig=sig)
-  logmsg("[%s] Context bars (Island & Genic) ...", sig);  plot_context_bars_all(meta, phenotype, sig = sig)
-  logmsg("[%s] CVI heatmap ...", sig);                    plot_cvi(meta, phenotype, sig = sig)
-  logmsg("[%s | %s] Running gometh...", phenotype, sig)
-
-go_res   <- run_gometh(meta, phenotype, sig, "GO")
-kegg_res <- run_gometh(meta, phenotype, sig, "KEGG")
-}
-
-logmsg("Effect-size correlation across regions (Panel C) ...")
-plot_region_cor_heatmaps(meta, phenotype)
-
-logmsg("DONE plotting for %s", phenotype)
-
-
-
-# -------------------- Config --------------------
-cfg <- list(
-  res_dir        = "03_MetaAnalysis/02_Results_Region_Stratified",
-  fig_dir        = "03_MetaAnalysis/03_Figures_Region_Stratified",
-  log_dir        = "03_MetaAnalysis/04_Logs",
-  alpha          = 0.05,
-  volcano_es_thr = 0.01,  # absolute beta cut
-  volcano_p_thr  = 0.05, # p-value threshold line (you can set to Bonf/FDR converted to p)
-  top_labels     = 20,       # label up to N points on Manhattan
-  gometh_min_sig = 100,      # minimum sig CpGs for GO/KEGG enrichment
-  gometh_collections = c("GO","KEGG"),
-  seed           = 123
-)
-dir.create(cfg$fig_dir, recursive = TRUE, showWarnings = FALSE)
-
-logmsg <- function(...) cat(format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "|", sprintf(...), "\n")
-
-# Put this below cfg and ggsave_tiff definitions
-use_common_theme <- function(base_size = 18, base_family = "") {
-  theme_set(
-    theme_cowplot(font_size = base_size, font_family = base_family) +
-      theme(
-        text = element_text(family = "Helvetica"),
-        plot.title   = element_text(hjust=0.5, face="bold", size=24),
-        plot.subtitle= element_text(hjust=0.5, face="italic", size=20),
-        axis.title   = element_text(face="bold", size=20),
-        axis.text    = element_text(face="bold", size=20),
-        legend.title = element_text(face="bold", size = 18),
-        legend.text  = element_text(face="bold", size = 18),
-        strip.text   = element_text(face="bold", size=20),
-        panel.background = element_rect(fill = "white", color = NA),
-    plot.background  = element_rect(fill = "white", color = NA)
-      )
-  )
-}
-use_common_theme()
-
-# TIFF saver (bold-friendly)
-ggsave_tiff <- function(filename, plot, width=10, height=6, dpi=600) {
-  ggsave(
-    filename,
-    plot = plot,
-    width = width,
-    height = height,
-    device = "tiff",
-    bg = "white",
-    dpi = dpi,
-    units = "in",
-    compression = "lzw"
-  )
-}
-
-# -------------------- IO helpers --------------------
-
-# -------------------- Summary bars --------------------
-
-
-
-
-# -------------------- Manhattan (robust chr mapping + subtitle with Nsig) --------------------
-
-
-# -------------------- Volcano --------------------
-# -------- Volcano with thresholds & axis breaks --------
-# dt: annotated meta (feA) for a single Region×CellType (or whole set with filtering)
-
-
-
-# -------- GO/KEGG term-name plotting --------
-# df: gometh() result; must contain columns 'P.DE' (raw p) and either 'Term' or 'Pathway'
-# db_label: "GO" or "KEGG" for title
-plot_gometh <- function(df, phenotype, sig = c("FDR","Bonf", "Nominal"), region, celltype, db_label = "GO", top_n = 15L) {
-  if (is.null(df) || !nrow(df)) return(invisible(NULL))
-
-dd <- as.data.table(df)
-  # detect term text column
- 
-  if (db_label == "GO") {
-  if (!all(c("ID", "TERM") %in% names(dd))) {
-    stop("GO results must contain 'Term' (ID) and 'TERM' (name)")
-  }
-  dd[, TermLabel := TERM]   # <-- THIS is what you want plotted
-
-} else if (db_label == "KEGG") {
-  if (!all(c("ID", "Description") %in% names(dd))) {
-    stop("KEGG results must contain 'Term' (ID) and 'Description' (name)")
-  }
-  dd[, TermLabel := Description]
-
-} else {
-  stop("db_label must be 'GO' or 'KEGG'")
-}
-
-# 2. Calculate Fold Enrichment (The "Enrichment Score")
-  # We use the full results 'df' to get global totals for the background rate
-  total_de <- sum(dd$DE, na.rm = TRUE)
-  total_n  <- sum(dd$N, na.rm = TRUE)
-  global_rate <- total_de / total_n
-  dd[, Fold_Enrichment := (DE / N) / global_rate]
- 
- pcol <- if ("P.DE" %in% names(dd)) "P.DE" else if ("FDR" %in% names(dd)) "FDR" else NULL
-
-if (is.null(pcol)) stop("No p-value column found")
-
-dd <- dd[is.finite(get(pcol)) & get(pcol) > 0]
-dd[, neglog10 := -log10(get(pcol))]
-
-  # allow both raw P and adjusted columns in gometh output
-  setorder(dd, -neglog10)
-  plot_data <- dd[1:min(top_n, .N)]
-
-  # wrap long labels
-  plot_data[, term_plot := stringr::str_trunc(TermLabel, 60)]
-  plot_data[, term_plot := factor(term_plot, levels = rev(term_plot))]
-
-  title_txt <- sprintf("%s Enrichment — %s (%s) | %s / %s",
-                     db_label, phenotype, sig, region, celltype)
-  p <- ggplot(plot_data, aes(x = Fold_Enrichment, y = term_plot)) + 
-  geom_segment(aes(x=0, xend = Fold_Enrichment, y = term_plot, yend = term_plot, color = neglog10), linewidth = 1) +
-  geom_point(aes(size = DE, color = neglog10), alpha = 0.8) +
-  scale_color_gradient(low = "navy", high = "firebrick3", name = expression(-log[10](pValue))) +
-  scale_size_continuous(name = "Count (DE)") +
-    #coord_flip() +
-    labs(title = title_txt, x = "Fold Enrichment", y = NULL) +
-    theme_cowplot() +
-    theme(
-      plot.title  = element_text(hjust = 0.5, face = "bold", size = 24),
-      axis.title  = element_text(face = "bold", size = 20),
-      axis.text   = element_text(face = "bold", size = 20),
-      legend.text = element_text(face = "bold", size = 18),
-      #panel.grid.major = element_line(color = "grey90"),
-      panel.background = element_rect(fill = "white", color = NA),
-    plot.background  = element_rect(fill = "white", color = NA)
-    )
-
-  fn <- file.path(cfg$fig_dir, sprintf("Enrichment_%s_%s_%s_%s_%s.tiff", db_label, phenotype, sig, region, celltype))
-  ggsave_tiff(fn, p, width = 20, height = 8.5)
-}
-
-run_gometh <- function(dt, phenotype, sig, collection = "GO") {
-
-  require(missMethyl)
-
-  flag <- switch(sig,
-  "FDR"     = "Sig_FDR",
-  "Bonf"    = "Sig_Bonf",
-  "Nominal" = "Sig_Nominal"
-)
-
+# ----------------------------------Gene ontology and pathway analysis--------------------------------------------------
+enrichment_analysis <- function(meta, phenotype, collection = "GO"){
   keys <- unique(dt[, .(Region, CellType)])
+
   for (i in seq_len(nrow(keys))) {
-    rr <- keys$Region[i]; ct <- keys$CellType[i]
-    sub <- dt[Region == rr & CellType == ct]
+    region_i <- keys$Region[i] 
+    celltype_j <- keys$CellType[i]
+    sub <- dt[Region == region_i & CellType == celltype_j]
     if (!nrow(sub)) next
-    sig_cpg <- unique(sub[get(flag) == TRUE, CpG])
-  all_cpg <- unique(sub$CpG)
+    sig_cpg <- unique(sub[Sig == TRUE, CpG])
+    all_cpg <- unique(sub$CpG)
 
-  if (length(sig_cpg) < 10) {
-    message(sprintf("[%s | %s] Not enough CpGs for %s", phenotype, sig, collection))
-    return(NULL)
+    go_meth <- missMethyl::gometh(
+      sig.cpg = sig_cpg,
+      all.cpg = all_cpg,
+      collection = collection
+    )
+    go_meth <- as.data.table(go_meth, keep.rownames = "ID")
+    go_meth$Phenotype <- phenotype
+
+    filepath <- c("") #file name and path to save GO results
+    write.csv(go_meth, filepath)
+
+    # Generate plots
+    # calculate fold enrichment
+    total_de <- sum(go_meth$DE, na.rm = TRUE)
+    total_n  <- sum(go_meth$N, na.rm = TRUE)
+    global_rate <- total_de / total_n
+    go_meth[, Fold_Enrichment := (DE / N) / global_rate] 
+
+    pcol <- if ("FDR" %in% names(go_meth)) "FDR" else "P.DE"
+    go_meth <- go_meth[is.finite(get(pcol)) & get(pcol) > 0]
+    go_meth[, neglog10 := -log10(get(pcol))]
+    setorder(go_meth, -neglog10)
+    
+    plot_data <- go_meth[1:min(15, .N)]
+    p <- ggplot(plot_data, aes(x = Fold_Enrichment, y = term_plot)) + 
+    geom_segment(aes(x=0, xend = Fold_Enrichment, y = term_plot, yend = term_plot, color = neglog10), linewidth = 1) +
+    geom_point(aes(size = DE, color = neglog10), alpha = 0.8) +
+    scale_color_gradient(low = "navy", high = "firebrick3", name = expression(-log[10](pValue))) +
+    scale_size_continuous(name = "Count (DE)") +
+    theme_cowplot()
+
+    filepath <- c("") #path to save the figure
+    ggsave(filepath, p, width = 20, height = 10)
   }
-
-  gom <- missMethyl::gometh(
-    sig.cpg = sig_cpg,
-    all.cpg = all_cpg,
-    collection = collection
-  )
-  gom <- as.data.table(gom, keep.rownames = "ID")
-  gom$Phenotype <- phenotype
-  gom$SigType <- sig
-
-  gom <- as.data.frame(gom)
-  #gom <- add_ids_if_possible(gom, collection)
-  fn <- file.path(cfg$res_dir, sprintf("Enrichment_%s_%s_%s_%s_%s.csv", collection, phenotype, sig, rr, ct))
-  write.csv(gom, fn)
-  plot_gometh(gom, phenotype, sig, rr, ct, collection)      
-  }
-
 }
 
+# run the function itiratively for GO and KEGG pathway enrichment analyses
+go_results <- enrichment_analysis(meta, phenotype, "GO")
+kegg_results <- enrichment_analysis(meta, phenotype, "KEGG")
+
+#---------------------------- Effect-size Rank Enrichment Analysis-------------------------------------------
+# related to Fig. 4
+# Evaluating cell-type enrichment of effect size for bulk tissue-level Braak CpGs (identified in Smith et al. 2021)
+# This analysis is limited to phenotype = "Braak"
+meta_dir_braak <- c("") # set path to directory containing meta analyzed tsv files for each Braak x region x celltype combination
+region <- c("") # specify brain region for analysis
+smith_list_filepath <- c("") # path to file containing list of CpGs from Smith et al 2021, for the given brain region
+smith_cpgs <- fread(smith_list_filepath)
+
+rank_enrichment_results <- list()
+celltypes <- c("")
+
+for (ct in celltypes) {
+meta_braak_file <- file.path(meta_dir_braak, paste0("", ct, ".tsv.gz")) # make sure file name contains cell type label
+dt <- fread(meta_braak_file)
+dt[, .(CpG, chr, bp, beta_hat, se_hat, z, pval)]
+
+  # perform wilcox rank sum test
+  dt[, is_smith := CpG %in% smith_cpgs]
+  w <- wilcox.test(
+  abs(dt$z[dt$is_smith == 1]),
+  abs(dt$z[dt$is_smith == 0]),
+  alternative = "greater"
+  )
+
+  w_data <- data.table(
+    n_smith_overlap = sum(dt$is_smith),
+    p_wilcox = w$p.value,
+    median_smith = median(abs(dt[is_smith == TRUE, z])),
+    median_background = median(abs(dt[is_smith == FALSE, z])),
+    direction_agreement = mean(sign(dt[is_smith == TRUE]$z) == sign(mean(dt[is_smith == FALSE]$z)))
+    )
+    
+  # perform AUC perm-test
+  observed_auc <- mean(rank(abs(dt$z))[dt$is_smith]) / nrow(dt)
+  perm_auc <- replicate(10000, {
+    perm <- sample(dt$is_smith)
+    mean(rank(dt$z)[perm]) / nrow(dt)
+  })
+
+  auc_data <- data.table(auc = obs_auc, p_perm = mean(perm_auc >= obs_auc))
+
+  rank_enrichment_results[[paste(ct)]] <- cbind(data.table(CellType = ct), w_data, auc_data)
+ }
+
+rank_enrichment_compiled <- rbindlist(rank_enrichment_results, fill = TRUE)
+fwrite(rank_enrichment_compiled, file.path("")) # save results
+
+# generate ridge plots after running all cell types
+plot_braak_ridges <- function(all_dt, smith_list, region) {
+  all_dt[, Smith := CpG %in% smith_list]
+  all_dt[, CellType := factor(CellType, levels = c("Astro", "Oligo_OPC", "Endo", "Neuron"))]
+  
+  ggplot(all_dt, aes(x = abs(z), y = CellType)) +
+  geom_density_ridges(
+    data = subset(all_dt, Smith == FALSE), fill = "grey80", alpha = 0.8, scale = 1.3) +
+  geom_density_ridges(data = subset(all_dt, Smith == TRUE), aes(fill = CellType), alpha = 0.9, scale = 1.3) +
+    scale_fill_manual(values=c(
+    "Neuron" = "#023743",
+    "Astro" = "#FED789",
+    "Oligo_OPC" = "#72874E",
+    "Endo" = "#476F84")) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    theme_classic()
+}
+
+# leading edge directional concordance analysis
+# this was done only between neurons and astrocytes in the PFC, in association with Braak stage for Smith CpGs
+neuron <- fread("") # path to meta-analyzed Braak association file for PFC neurons
+astro <- fread("") # path to meta-analyzed Braak association file for PFC astrocytes
+smith <- fread("") # path to file containing braak-association ES/SE data for the PFC from Smith et al. 2021
+
+# calculate z-values
+neuron[, z_cell := beta_hat / se_hat]
+astro[, z_cell := beta_hat / se_hat]
+smith[, z_smith := beta_hat / se_hat]
+neuron[, CellType := "Neuron"]
+astro[, CellType := "Astro"]
+
+dt <- rbind(neuron, astro)
+dt <- merge(dt, smith[, .(CpG, z_smith)], by = "CpG")
+dt <- dt[is.finite(z_cell) & is.finite(z_smith)]
+
+# leading edge function
+leading_edge <- function(d, step = 5) {
+  d <- d[order(-abs(z_smith))]
+  n <- nrow(d)
+  ks <- seq(step, n, by = step)
+  
+  data.table(
+    frac = ks / n,
+    concordance = sapply(ks, function(k) {
+      mean(sign(d$z_cell[1:k]) == sign(d$z_smith[1:k]))
+    })
+  )
+}
+
+# compute leading edge for neuron and astrocytes
+le_neuron  <- leading_edge(dt[CellType == "Neuron"])
+le_astro <- leading_edge(dt[CellType == "Astro"])
+
+# Plot leading edge concordance
+p <- ggplot() + 
+geom_smooth(data = le_astro, aes(x = frac, y = concordance), method = "loess", span = 0.2) +
+geom_smooth(data = le_neuron, aes(x = frac, y = concordance), method = "loess", span = 0.2) +
+geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey40") #reference line +
+scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = c(0.1, 0.25, 0.5, 0.75, 1)
+  ) +
+theme_classic()
+
+filepath <- c("")
+ggsave(filepath, p, width=10, height=6)
+
+# comparison between neuron vs astrocyte concordance for top 50 ranked Smith-CpGs by |z|
+astro_obs <- mean(sign(le_astro$z_cell[1:50]) == sign(le_astro$z_smith[1:50]))
+neur_obs  <- mean(sign(le_neur$z_cell[1:50]) == sign(le_neur$z_smith[1:50]))
+delta_obs <- astro_obs - neur_obs
+
+perm_delta <- replicate(1000, {
+    idx <- sample(seq_len(nrow(le_astro)))
+    astro_perm <- mean(sign(le_astro$z_cell[idx][1:50]) == sign(le_astro$z_smith[1:50]))
+    neur_perm <- mean(sign(le_neur$z_cell[idx][1:50]) == sign(le_neur$z_smith[1:50]))
+    astro_perm - neur_perm
+  })
 
 
+#----------------------------------------- Age-to-disease trajectory analysis--------------------------------------------------
+# related to Fig. 5
+# to compute directional and ES magnitude-related change in age-associated DMPs between age- and AD-associations across cell types x regions
+# run once per region x celltype combination
 
+age <- fread("") # load age-association data for cell type x region
+ad <- fread("") # load AD-association data for the same cell type x region
+
+age_sig <- age[pval < 0.05]
+dt <- merge(age_sig[, .(CpG, beta_age = beta_hat)], 
+                ad[, .(CpG, beta_ad = beta_hat)], by = "CpG")
+    
+# Remove any non-finite values for regression
+dt <- dt[is.finite(beta_age) & is.finite(beta_ad)]
+
+# Perform linear regression analysis for AD ~ Age
+# The slope (beta) measures ES acceleration/divergence
+model <- lm(beta_ad ~ beta_age, data = dt)
+slope_val <- coef(model)[2]
+slope_p    <- summary(model)$coefficients["beta_age", "Pr(>|t|)"]
+
+# compute correlation
+cor_test   <- cor.test(dt$beta_age, dt$beta_ad)
+r_val      <- cor_test$estimate
+cor_p      <- cor_test$p.value
+
+# scatter plot
+p_scatter <- ggplot(dt, aes(x = beta_age, y = beta_ad)) +
+      geom_point(size = 1) + 
+      geom_smooth(method = "lm", color = "black", linetype = "solid") +
+      theme_cowplot() 
+
+filepath <- c("")
+ggsave(filepath, p_scatter, width = 6, height = 6)
