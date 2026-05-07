@@ -140,19 +140,140 @@ meta_files <- list.files(meta, pattern = "\\.tsv\\.gz$", full.names = TRUE)
 file_list <- data.table(path = files, file = basename(files))
 meta <- rbindlist(lapply(file_list$path, fread, use.names = TRUE, fill = TRUE))
 
+# We'll create functions to generate plots
+# summary bubble/dot plots
+summary_dotplot <- function(meta, phenotype) {
+  # Aggregate counts of significant DMCs
+  # We count hyper and hypo separately to show directionality via color
+  summary_dt <- meta[get(flag) == TRUE, .(
+    Total = .N,
+    Hyper = sum(beta_hat > 0, na.rm = TRUE),
+    Hypo  = sum(beta_hat < 0, na.rm = TRUE)
+  ), by = .(Region, CellType)]
+  summary_dt[, Direction := (Hyper - Hypo) / Total]
+  
+  p <- ggplot(summary_dt, aes(x = CellType, y = Region)) +
+    geom_point(aes(size = Total, fill = Direction), shape = 21, stroke = 1) +
+    scale_size_continuous(range = c(2, 18), name = "N Sig CpGs",
+    breaks = seq(0, max(summary_dt$Total, na.rm = TRUE), length.out = 5) %>% round() %>% unique()) +
+    scale_fill_gradient2(low = "#f2c45f", mid = "white", high = "#298c8c", 
+                         midpoint = 0, name = "Proportion") +
+    theme_cowplot() +
+    labs(
+      title = sprintf("Differential Methylation Burden: %s", phenotype),
+      subtitle = sprintf("Comparison of %s-significant sites across cell types and regions", sig_type),
+      x = "Cell Type", y = "Brain Region"
+    )  
+
+  filepath <- c("") # path to save the figure
+  ggsave(filepath, p, width = 10, height = 8)
+  }
+
+# Manhattan plot
+plot_manhattan <- function(meta, phenotype) {
+  keys <- unique(meta[, .(Region, CellType)]) #generate list of region x cell type combinations for given phenotype
+  for (i in seq_len(nrow(keys))) {
+    region_i <- keys$Region[i] 
+    celltype_j <- keys$CellType[i]
+    sub <- meta[Region == region_i & CellType == celltype_j]
+    if (!nrow(sub)) next
+
+    anno <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+    anno <- as.data.table(anno, keep.rownames = "CpG")
+
+    sub_plot <- copy(sub) # copy the data to generate a "sub" plot for each celltype x region combination
+
+    sub_plot[anno, on = "CpG", `:=`(
+      chr = as.character(i.chr),
+      bp = i.pos,
+      UCSC_RefGene_Name = i.UCSC_RefGene_Name
+      )]
+    chrLengths <- sub_plot[, .(max_bp = max(bp, na.rm = TRUE)), by = chr][order(chr)]
+    chrLengths[, bp_add := data.table::shift(cumsum(as.numeric(max_bp)), fill = 0, type = "lag")]
+    chrLengths[, chr_center := bp_add + max_bp / 2]
+  
+    sub_plot[chrLengths, on = "chr", bp_add := i.bp_add]
+    sub_plot[, `:=`(
+      bpCummulative = bp + bp_add,
+      log10_p = -log10(pval)
+      )]
+
+    # Set significance threshold
+    sig_thr <- !is.na(sub_plot[[FDR]]) & sub_plot[[FDR]] < 0.05
+    thr_line <- if (any(sig_thr)) -log10(max(sub_plot$pval[sig_mask], na.rm = TRUE)) else NA_real_
+
+    # Generate the plot
+    p <- ggplot(sub_plot, aes(bpCummulative, log10_p)) +
+    geom_point(aes(color = factor(chr %% 2)), size = 0.6, alpha = 0.75, show.legend = FALSE) +
+    scale_color_manual(values = c("0" = "orange3", "1" = "blue4")) +
+    theme_cowplot() +
+    scale_x_continuous(
+    breaks = chrLengths$chr_center, 
+    labels = c(1:22, "X", "Y")[1:nrow(chrLengths)], 
+    expand = c(0.01, 0)
+    )
+
+    # Add significance threshold line
+    if (is.finite(thr_line)) {
+    p <- p + geom_hline(yintercept = thr_line, color = "red", linetype = "solid", linewidth = 1.2)
+    }
+    
+    filepath <- c("") # path to save the figure
+    ggsave(filepath, p, width = 10, height = 8)
+    }
+}
+
+# Volcano plot
+plot_volcano <- function(meta, phenotype) {
+  keys <- unique(meta[, .(Region, CellType)])
+  for (i in seq_len(nrow(keys))) {
+    region_i <- keys$Region[i] 
+    celltype_j <- keys$CellType[i]
+    sub <- meta[Region == region_i & CellType == celltype_j & is.finite(get(p_col)) & get(p_col) > 0]
+    if (!nrow(sub)) next
+
+    sub[, neglog10p := -log10(get(p_col))]
+    sub[, sig := (get(p_col) < 0.05)]
+    
+    xmax <- max(abs(sub[["beta_hat"]]), na.rm = TRUE)
+    xmax <- max(xmax, 0.005) * 1.1 # we use 0.005 as threshold for age association, change if necessary
+    sub[, beta := get("beta_hat")]
+    sub[, category := fifelse(
+    get(p_col) < 0.05 & beta >= 0.005, "Hyper_sig",
+    fifelse(get(p_col) < 0.05 & beta <= -0.005, "Hypo_sig",
+    fifelse(get(p_col) < 0.05, "Sig_small",
+    "NS")))
+    ]
+
+    p <- ggplot(sub, aes(x = beta, y = neglog10p)) + 
+    geom_point(aes(color = category), alpha = 0.7, size = 1.2) +
+    scale_color_manual(values = c(
+    "Hyper_sig" = "#298c8c",   
+    "Hypo_sig"  = "#f2c45f",   
+    "Sig_small" = "grey70",    
+    "NS"        = "grey40"     
+    )) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +\
+    geom_vline(xintercept = c(-0.005, 0.005), linetype = "dashed", color = "black") +
+    scale_x_continuous(
+    limits = c(-0.1, 0.1),
+    breaks = seq(-0.1, 0.1, by = 0.02)
+    ) +
+    scale_y_continuous(breaks = scales::pretty_breaks(n = 6)) +
+    theme_cowplot()
+
+    filepath <- c("") # path to save the figure
+    ggsave(filepath, p, width = 8, height = 8)
+   }
+}
+
+# running the plotting functions:
+summary_dotplot(meta, phenotype)
+plot_manhattan(meta, phenotype)
+plot_volcano(meta, phenotype)
 
 
-
-
-
-
-
-
-
-
-
-
-
+# Gene ontology and pathway analysis---------------------------------------------------------------
 
 
 for (sig in c("FDR","Bonf","Nominal")) {
@@ -173,21 +294,7 @@ plot_region_cor_heatmaps(meta, phenotype)
 
 logmsg("DONE plotting for %s", phenotype)
 
-#!/usr/bin/env Rscript
 
-suppressPackageStartupMessages({
-  library(data.table)
-  library(stringr)
-  library(ggplot2)
-  library(cowplot)
-  library(ggrepel)
-  library(minfi)
-  library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
-  suppressWarnings(suppressMessages(requireNamespace("missMethyl", quietly = TRUE)))
-  suppressWarnings(suppressMessages(requireNamespace("GO.db", quietly = TRUE)))
-  suppressWarnings(suppressMessages(requireNamespace("AnnotationDbi", quietly = TRUE)))
-  suppressWarnings(suppressMessages(requireNamespace("KEGGREST", quietly = TRUE)))
-})
 
 # -------------------- Config --------------------
 cfg <- list(
@@ -245,253 +352,16 @@ ggsave_tiff <- function(filename, plot, width=10, height=6, dpi=600) {
 
 # -------------------- Summary bars --------------------
 
-plot_glia_summary_dotplot <- function(dt, phenotype, sig = c("FDR", "Bonf", "Nominal")) {
-  sig_type <- match.arg(sig)
-  flag <- switch(sig,
-  "FDR" = "Sig_FDR",
-  "Bonf" = "Sig_Bonf",
-  "Nominal" = "Sig_Nominal"
-)
-  
-  # Aggregate counts of significant DMCs
-  # We count hyper and hypo separately to show directionality via color
-  summary_dt <- dt[get(flag) == TRUE, .(
-    Total = .N,
-    Hyper = sum(beta_hat > 0, na.rm = TRUE),
-    Hypo  = sum(beta_hat < 0, na.rm = TRUE)
-  ), by = .(Region, CellType)]
-  
-  if (nrow(summary_dt) == 0) {
-    logmsg("No significant results found for %s (%s). Skipping dotplot.", phenotype, sig_type)
-    return(NULL)
-  }
-  
-  # Calculate a 'Direction' metric: 1 if mostly hyper, -1 if mostly hypo
-  summary_dt[, Direction := (Hyper - Hypo) / Total]
-  
-  p <- ggplot(summary_dt, aes(x = CellType, y = Region)) +
-    # The 'size' of the dot represents the total number of significant sites
-    # The 'fill' color represents the hyper/hypo balance
-    geom_point(aes(size = Total, fill = Direction), shape = 21, stroke = 1) +
-    scale_size_continuous(range = c(2, 18), name = "N Sig CpGs",
-    breaks = seq(0, max(summary_dt$Total, na.rm = TRUE), length.out = 5) %>% round() %>% unique()) +
-    scale_fill_gradient2(low = "#f2c45f", mid = "white", high = "#298c8c", 
-                         midpoint = 0, name = "Proportion") +
-    theme_minimal() +
-    theme_cowplot() +
-    labs(
-      title = sprintf("Differential Methylation Burden: %s", phenotype),
-      subtitle = sprintf("Comparison of %s-significant sites across cell types and regions", sig_type),
-      x = "Cell Type", y = "Brain Region"
-    ) +
-    theme(plot.title = element_text(face="bold", size=24),
-      axis.text.x = element_text(face = "bold", size = 20),
-      axis.text.y = element_text(face = "bold", size = 20),
-      axis.title  = element_text(face="bold", size=20, margin = margin(t = 10, unit = "pt")),
-          legend.title= element_text(face="bold"),
-          legend.text = element_text(face="bold"),
-          panel.background = element_rect(fill = "white", color = NA),
-    plot.background  = element_rect(fill = "white", color = NA),
-      panel.grid.major = element_line(color = "grey90")
-    )
-  
-  fn <- file.path(cfg$fig_dir, sprintf("Summary_Dotplot_%s_%s.tiff", phenotype, sig_type))
-  ggsave_tiff(fn, p, width = 10, height = 8)
-  logmsg("Glia dominance dotplot saved to: %s", fn)
-}
+
 
 
 # -------------------- Manhattan (robust chr mapping + subtitle with Nsig) --------------------
-manhattan_one <- function(sub, phenotype, sig = c("FDR","Bonf", "Nominal"), region, celltype) {
-  sub_plot <- copy(sub)
-  
-  sig <- match.arg(sig)
-  sig_col <- switch(sig,
-  "FDR" = "FDR",
-  "Bonf" = "Bonf",
-  "Nominal" = "pval"
-)
-  anno <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
 
-
-  anno <- as.data.table(anno, keep.rownames = "CpG")
-
-
-
-  # Filter valid genomic rows
-  sub_plot <- sub_plot[!is.na(chr) & !is.na(bp) & !is.na(pval)]
-
-sub_plot[anno, on = "CpG", `:=`(
-chr = as.character(i.chr),
-bp = i.pos,
-UCSC_RefGene_Name = i.UCSC_RefGene_Name
-)]
-  
-
-sub_plot[, chr := gsub("chr", "", chr)]
-  sub_plot[, chr := ifelse(chr == "X", "23", ifelse(chr == "Y", "24", chr))]
-  sub_plot[, chr := as.numeric(chr)]
-  sub_plot <- sub_plot[!is.na(chr)] 
-  
-  chrLengths <- sub_plot[, .(max_bp = max(bp, na.rm = TRUE)), by = chr][order(chr)]
-  
-  chrLengths[, bp_add := data.table::shift(cumsum(as.numeric(max_bp)), fill = 0, type = "lag")]
-  
-  chrLengths[, chr_center := bp_add + max_bp / 2]
-  
-  sub_plot[chrLengths, on = "chr", bp_add := i.bp_add]
-  sub_plot[, `:=`(
-  bpCummulative = bp + bp_add,
-  log10_p = -log10(pval)
-  )]
-  
-
-  
-  # 4. Significance Threshold
-  sig_mask <- !is.na(sub_plot[[sig_col]]) & sub_plot[[sig_col]] < 0.05
-  thr_line <- if (any(sig_mask)) -log10(max(sub_plot$pval[sig_mask], na.rm = TRUE)) else NA_real_
-  
-  # 5. Top Labels
-  lab_dt <- sub_plot[sig_mask][order(get(sig_col), pval)]
-  if (nrow(lab_dt) > 0) {
-    n_labels <- if(exists("cfg")) cfg$top_labels else 15
-    lab_dt <- lab_dt[1:min(n_labels, .N)]
-lab_dt[, Gene := sapply(strsplit(as.character(UCSC_RefGene_Name), ";"),
-function(x) if(length(x) > 0) x[1] else "")]
-lab_dt[, PlotLabel := ifelse(Gene != "", 
-sprintf("%s\n(%s)", CpG, Gene), CpG)]
-}
- 
-  
-  # 6. Plotting
-  p <- ggplot(sub_plot, aes(bpCummulative, log10_p)) +
-    geom_point(aes(color = factor(chr %% 2)), size = 0.6, alpha = 0.75, show.legend = FALSE) +
-    scale_color_manual(values = c("0" = "orange3", "1" = "blue4")) +
-    theme_cowplot() +
-    labs(
-      title = sprintf("%s (%s) | %s | %s", phenotype, sig, region, celltype),
-      subtitle = sprintf("Significant (%s < %.2g): %d CpGs", sig, 0.05, sum(sig_mask)),
-      x = "Chromosome",
-      y = expression(bold(-log[10](p)))
-    ) +
-    theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 24),
-          plot.subtitle = element_text(hjust = 0.5, face = "italic", size = 20),
-          panel.background = element_rect(fill = "white", color = NA),
-    plot.background  = element_rect(fill = "white", color = NA))
-  
-  # X-axis scale using numeric midpoints
-  p <- p + scale_x_continuous(
-    breaks = chrLengths$chr_center, 
-    labels = c(1:22, "X", "Y")[1:nrow(chrLengths)], 
-    expand = c(0.01, 0)
-  )
-  
-  
-if (is.finite(thr_line)) {
-  p <- p + geom_hline(yintercept = thr_line, color = "red", linetype = "solid", linewidth = 1.2)
-}
-
-  
-  if (nrow(lab_dt)) {
-    p <- p + ggrepel::geom_label_repel(
-      data = lab_dt, aes(label = PlotLabel), 
-      size = 3, box.padding = 0.5, max.overlaps = 20, fontface = "bold"
-    )
-  }
-  
-  # 7. Safe Saving
-  if(!dir.exists(cfg$fig_dir)) dir.create(cfg$fig_dir, recursive = TRUE)
-  fn <- file.path(cfg$fig_dir, sprintf("Manhattan_%s_%s_%s_%s.tiff", phenotype, sig, region, celltype))
-  
-  # Use standard ggsave if ggsave_tiff isn't defined
-  ggsave(fn, p, width = 12, height = 7, compression = "lzw", dpi = 300)
-}
-
-plot_manhattan_all <- function(dt, phenotype, sig = c("FDR","Bonf", "Nominal")) {
-  sig <- match.arg(sig)
-  keys <- unique(dt[, .(Region, CellType)])
-  for (i in seq_len(nrow(keys))) {
-    rr <- keys$Region[i]; ct <- keys$CellType[i]
-    sub <- dt[Region == rr & CellType == ct]
-    if (!nrow(sub)) next
-    manhattan_one(sub, phenotype, sig = sig, region = rr, celltype = ct)
-  }
-}
 
 # -------------------- Volcano --------------------
 # -------- Volcano with thresholds & axis breaks --------
 # dt: annotated meta (feA) for a single Region×CellType (or whole set with filtering)
-plot_volcano_one <- function(dt, phenotype, region, celltype,
-                             sig = c("FDR","Bonf", "Nominal"), beta_col = "beta_hat",
-                             p_thresh = 0.05, effect_thresh = 0.005) {
 
-  sig <- match.arg(sig)
-  p_col <- switch(sig,
-  "FDR" = "FDR",
-  "Bonf" = "Bonf",
-  "Nominal" = "pval"
-)
-
-  sub <- dt[Region == region & CellType == celltype & is.finite(get(p_col)) & get(p_col) > 0]
-  if (!nrow(sub)) return(invisible(NULL))
-
-  sub[, neglog10p := -log10(get(p_col))]
-  sub[, sig := (get(p_col) < p_thresh)]
-  xmax <- max(abs(sub[[beta_col]]), na.rm = TRUE)
-  xmax <- max(xmax, effect_thresh) * 1.1
-  sub[, beta := get(beta_col)]
-  sub[, beta := get(beta_col)]
-sub[, category := fifelse(
-  get(p_col) < p_thresh & beta >= effect_thresh, "Hyper_sig",
-  fifelse(get(p_col) < p_thresh & beta <= -effect_thresh, "Hypo_sig",
-  fifelse(get(p_col) < p_thresh, "Sig_small",
-  "NS")))
-]
-  
-  p <- ggplot(sub, aes(x = beta, y = neglog10p)) +
-  geom_point(aes(color = category), alpha = 0.7, size = 1.2) +
-
-  scale_color_manual(values = c(
-    "Hyper_sig" = "#298c8c",   # your hyper color
-    "Hypo_sig"  = "#f2c45f",   # your hypo color
-    "Sig_small" = "grey70",    # sig but small effect
-    "NS"        = "grey40"     # non-sig
-  )) +
-
-  geom_hline(yintercept = -log10(p_thresh), linetype = "dashed", color = "black") +
-  geom_vline(xintercept = c(-effect_thresh, effect_thresh), linetype = "dashed", color = "black") +
-
-  scale_x_continuous(
-    limits = c(-0.1, 0.1),
-    breaks = seq(-0.1, 0.1, by = 0.02)
-  ) +
-    scale_y_continuous(breaks = scales::pretty_breaks(n = 6)) +
-    labs(
-      title = sprintf("Volcano — %s : %s / %s\n %s<%.2g, |Δβ|≥%.3f", phenotype, region, celltype, sig, p_thresh, effect_thresh),
-      x = expression(beta),
-      y = expression(-log[10](p))
-    ) +
-    theme_cowplot() +
-    theme(
-      plot.title  = element_text(hjust = 0.5, face = "bold", size = 14),
-      axis.title  = element_text(face = "bold"),
-      axis.text   = element_text(face = "bold"),
-      panel.background = element_rect(fill = "white", color = NA),
-    plot.background  = element_rect(fill = "white", color = NA)
-    )
-
-  fn <- file.path(cfg$fig_dir, sprintf("Volcano_%s_%s_%s_%s.tiff", phenotype, sig, region, celltype))
-  ggsave_tiff(fn, p, width = 6.5, height = 6.0)
-}
-
-# helper to loop all Region×CellType combos
-plot_volcano_all <- function(dt, phenotype, sig, p_thresh = 0.05, effect_thresh = 0.005) {
-  keys <- unique(dt[, .(Region, CellType)])
-  for (i in seq_len(nrow(keys))) {
-    rr <- keys$Region[i]; ct <- keys$CellType[i]
-    plot_volcano_one(dt, phenotype, rr, ct, sig, p_thresh = p_thresh, effect_thresh = effect_thresh)
-  }
-}
 
 
 # -------- GO/KEGG term-name plotting --------
