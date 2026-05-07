@@ -1,6 +1,7 @@
 # Cell-Meta-Analysis-Bhaskar
 
 **A Cell-Type-Resolved Meta-Analysis Reveals Glial DNA Methylation Changes Associated with Aging and Alzheimer's Disease**
+
 Uchit Bhaskar, Mark Z. Kos*, Melanie A. Carless*
 
 Corresponding authors: mark.kos@utrgv.edu OR melanie.carless@utsa.edu
